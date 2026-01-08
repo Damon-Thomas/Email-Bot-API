@@ -19,6 +19,13 @@ const rateLimiter = new RateLimiterMemory({
   duration: parseInt(process.env.RATE_LIMIT_DURATION || "60"), // Per seconds
 });
 
+// ============================================================
+// 🔧 DEV MODE - Set ALLOW_ALL_ORIGINS=true in env to bypass CORS
+// ⚠️  Set to false or remove in production!
+// ============================================================
+const DEV_MODE_ALLOW_ALL_ORIGINS = process.env.ALLOW_ALL_ORIGINS === "true";
+// ============================================================
+
 // Enhanced CORS configuration
 const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(",").map((origin) =>
   origin.trim()
@@ -36,6 +43,11 @@ const corsOptions = {
   ) => {
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) {
+      return callback(null, true);
+    }
+
+    // DEV MODE: Allow all origins
+    if (DEV_MODE_ALLOW_ALL_ORIGINS) {
       return callback(null, true);
     }
 
