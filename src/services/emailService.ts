@@ -1,5 +1,3 @@
-import nodemailer from "nodemailer";
-import { google } from "googleapis";
 import { logger } from "../utils/logger.js";
 
 interface EmailOptions {
@@ -18,155 +16,152 @@ interface EmailResult {
   messageId: string;
 }
 
+interface BrevoRecipient {
+  email: string;
+  name?: string;
+}
+
+interface BrevoEmailPayload {
+  sender: { email: string; name: string };
+  to: BrevoRecipient[];
+  subject: string;
+  textContent?: string;
+  htmlContent?: string;
+  attachment?: Array<{ name: string; content: string }>;
+}
+
 class EmailService {
-  private transporter: nodemailer.Transporter | null = null;
+  private getConfig() {
+    return {
+      apiKey: process.env.BREVO_API_KEY || "",
+      fromEmail: process.env.BREVO_FROM_EMAIL || "",
+      fromName: process.env.BREVO_FROM_NAME || "Mailer API",
+    };
+  }
 
-  async getTransporter(): Promise<nodemailer.Transporter> {
-    if (this.transporter) {
-      return this.transporter;
+  private validateConfig(): void {
+    const { apiKey, fromEmail } = this.getConfig();
+    if (!apiKey) {
+      throw new Error(
+        "Brevo configuration missing. Please provide BREVO_API_KEY environment variable."
+      );
     }
-
-    try {
-      // Check if OAuth2 credentials are provided
-      const hasOAuth2 =
-        process.env.GMAIL_CLIENT_ID &&
-        process.env.GMAIL_CLIENT_SECRET &&
-        process.env.GMAIL_REFRESH_TOKEN;
-
-      // Check if app password is provided
-      const hasAppPassword = process.env.GMAIL_APP_PASSWORD;
-
-      if (hasOAuth2) {
-        // Gmail OAuth2 setup
-        const oauth2Client = new google.auth.OAuth2(
-          process.env.GMAIL_CLIENT_ID,
-          process.env.GMAIL_CLIENT_SECRET,
-          "https://developers.google.com/oauthplayground"
-        );
-
-        oauth2Client.setCredentials({
-          refresh_token: process.env.GMAIL_REFRESH_TOKEN || null,
-        });
-
-        const accessToken = await oauth2Client.getAccessToken();
-
-        this.transporter = nodemailer.createTransport({
-          service: "gmail",
-          auth: {
-            type: "OAuth2",
-            user: process.env.GMAIL_USER,
-            clientId: process.env.GMAIL_CLIENT_ID,
-            clientSecret: process.env.GMAIL_CLIENT_SECRET,
-            refreshToken: process.env.GMAIL_REFRESH_TOKEN,
-            accessToken: accessToken.token,
-          },
-          tls: {
-            rejectUnauthorized: false,
-          },
-        } as nodemailer.TransportOptions);
-
-        logger.info("Using Gmail OAuth2 authentication");
-      } else if (hasAppPassword) {
-        // Gmail App Password setup (simpler)
-        this.transporter = nodemailer.createTransport({
-          service: "gmail",
-          auth: {
-            user: process.env.GMAIL_USER,
-            pass: process.env.GMAIL_APP_PASSWORD,
-          },
-          tls: {
-            rejectUnauthorized: false,
-          },
-        });
-
-        logger.info("Using Gmail App Password authentication");
-      } else {
-        throw new Error(
-          "No valid Gmail authentication method configured. Please provide either OAuth2 credentials or an app password."
-        );
-      }
-
-      // Verify the connection
-      if (this.transporter) {
-        await this.transporter.verify();
-        logger.info("Gmail transporter created and verified successfully");
-      }
-
-      return this.transporter as nodemailer.Transporter;
-    } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : "Unknown error";
-      logger.error("Failed to create Gmail transporter", {
-        error: errorMessage,
-      });
-      throw new Error("Failed to setup email service: " + errorMessage);
+    if (!fromEmail) {
+      throw new Error(
+        "Brevo configuration missing. Please provide BREVO_FROM_EMAIL environment variable."
+      );
     }
   }
 
   async sendEmail(options: EmailOptions): Promise<EmailResult> {
     try {
-      const transporter = await this.getTransporter();
+      this.validateConfig();
+      const { apiKey, fromEmail, fromName } = this.getConfig();
 
-      const mailOptions = {
-        from: `${process.env.GMAIL_FROM_NAME || "Mailer API"} <${
-          process.env.GMAIL_USER
-        }>`,
-        to: Array.isArray(options.to) ? options.to.join(", ") : options.to,
+      // Prepare recipient list
+      const recipients: BrevoRecipient[] = Array.isArray(options.to)
+        ? options.to.map((email) => ({ email }))
+        : [{ email: options.to }];
+
+      // Prepare email payload
+      const payload: BrevoEmailPayload = {
+        sender: {
+          email: fromEmail,
+          name: fromName,
+        },
+        to: recipients,
         subject: options.subject,
-        text: options.text,
-        html: options.html,
-        attachments: options.attachments,
       };
 
-      const result = await transporter.sendMail(mailOptions);
+      if (options.text) {
+        payload.textContent = options.text;
+      }
+      if (options.html) {
+        payload.htmlContent = options.html;
+      }
 
-      logger.info("Email sent successfully", {
-        messageId: result.messageId,
+      // Handle attachments if provided
+      if (options.attachments && options.attachments.length > 0) {
+        payload.attachment = options.attachments.map((att) => ({
+          name: att.filename,
+          content: Buffer.isBuffer(att.content)
+            ? att.content.toString("base64")
+            : att.content,
+        }));
+      }
+
+      // Send email via Brevo HTTP API using fetch
+      const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "api-key": apiKey,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const data = (await response.json()) as {
+        messageId?: string;
+        message?: string;
+        code?: string;
+      };
+
+      if (!response.ok) {
+        throw new Error(
+          data.message || `HTTP ${response.status}: ${data.code}`
+        );
+      }
+
+      logger.info("Email sent successfully via Brevo HTTP API", {
+        messageId: data.messageId,
         to: options.to,
         subject: options.subject,
       });
 
-      return { messageId: result.messageId };
-    } catch (error) {
+      return { messageId: data.messageId || "unknown" };
+    } catch (error: any) {
       const errorMessage =
-        error instanceof Error ? error.message : "Unknown error";
+        error?.message || error?.body?.message || "Unknown error";
+      const errorCode = error?.response?.statusCode || error?.statusCode;
 
       // Enhanced error categorization for better user feedback
       let userFriendlyMessage = errorMessage;
-      let errorType = "SMTP_ERROR";
+      let errorType = "API_ERROR";
 
-      if (
-        errorMessage.includes("Invalid login") ||
-        errorMessage.includes("authentication failed")
-      ) {
+      if (errorCode === 401 || errorMessage.includes("unauthorized")) {
         userFriendlyMessage =
-          "Gmail authentication failed. Please check your credentials.";
+          "Brevo authentication failed. Please check your API key.";
         errorType = "AUTH_ERROR";
       } else if (
-        errorMessage.includes("Recipient address rejected") ||
-        errorMessage.includes("invalid address")
+        errorCode === 400 ||
+        errorMessage.includes("invalid") ||
+        errorMessage.includes("email")
       ) {
-        userFriendlyMessage = "Invalid recipient email address.";
-        errorType = "RECIPIENT_ERROR";
+        userFriendlyMessage = "Invalid email address or request data.";
+        errorType = "VALIDATION_ERROR";
       } else if (
-        errorMessage.includes("Message too large") ||
+        errorCode === 413 ||
+        errorMessage.includes("too large") ||
         errorMessage.includes("size limit")
       ) {
         userFriendlyMessage =
           "Email message is too large. Please reduce size or attachments.";
         errorType = "SIZE_ERROR";
       } else if (
-        errorMessage.includes("Daily sending quota") ||
+        errorCode === 429 ||
+        errorMessage.includes("quota") ||
         errorMessage.includes("rate limit")
       ) {
         userFriendlyMessage =
-          "Gmail daily sending limit reached. Please try again later.";
+          "Daily sending limit reached. Please try again later.";
         errorType = "QUOTA_ERROR";
       } else if (
+        errorCode >= 500 ||
         errorMessage.includes("connection") ||
         errorMessage.includes("timeout")
       ) {
-        userFriendlyMessage = "Network connection error. Please try again.";
+        userFriendlyMessage = "Brevo service error. Please try again.";
         errorType = "NETWORK_ERROR";
       } else if (
         errorMessage.includes("spam") ||
@@ -177,9 +172,10 @@ class EmailService {
         errorType = "POLICY_ERROR";
       }
 
-      logger.error("Failed to send email", {
+      logger.error("Failed to send email via Brevo HTTP API", {
         error: errorMessage,
         errorType,
+        errorCode,
         to: options.to,
         subject: options.subject,
       });
@@ -188,15 +184,10 @@ class EmailService {
       const enhancedError = new Error(userFriendlyMessage);
       (enhancedError as any).originalError = errorMessage;
       (enhancedError as any).errorType = errorType;
+      (enhancedError as any).errorCode = errorCode;
 
       throw enhancedError;
     }
-  }
-
-  // Reset transporter (useful for refreshing credentials)
-  resetTransporter(): void {
-    this.transporter = null;
-    logger.info("Email transporter reset");
   }
 }
 
@@ -204,4 +195,3 @@ class EmailService {
 const emailService = new EmailService();
 export const sendEmail = (options: EmailOptions) =>
   emailService.sendEmail(options);
-export const resetEmailService = () => emailService.resetTransporter();
